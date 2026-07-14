@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="GIF Library placeholder icon">
+  <rect width="512" height="512" rx="112" fill="#18191f"/>
+  <rect x="96" y="116" width="320" height="280" rx="48" fill="#7868c9"/>
+  <circle cx="184" cy="206" r="36" fill="#f5f5f7"/>
+  <path d="M128 344l88-92 62 58 44-42 62 76H128z" fill="#f5f5f7"/>
+</svg>

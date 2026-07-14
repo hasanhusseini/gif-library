@@ -1,0 +1,26 @@
+[package]
+name = "giflib"
+version = "1.0.0"
+description = "A local GIF and reaction-media library"
+authors = ["cata"]
+edition = "2021"
+
+[lib]
+name = "gif_library_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+base64 = "0.22"
+serde_json = "1"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_System_DataExchange", "Win32_System_Memory"] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-global-shortcut = "=2.3.2"
+tauri-plugin-dialog = "=2.7.1"

@@ -1,0 +1,36 @@
+node_modules/
+dist/
+src-tauri/target/
+*.log
+.DS_Store
+
+# Local/editor/agent metadata
+.agents/
+.codex/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local databases and exports
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+*.json.bak
+
+# Backups/temp files
+*.bak
+*.tmp
+*.temp
+*backup*
+*Backup*
+
+# Release artifacts, belt-and-suspenders
+*.exe
+*.msi
+*.zip
+*.7z
+*.rar

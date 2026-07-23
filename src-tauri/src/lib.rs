@@ -29,7 +29,10 @@ use storage::{
     list_available_local_media_ids, read_media_preview, reveal_local_media, upload_manual_preview,
 };
 use tauri::Manager;
-use transfer::{apply_import, export_aliases, export_library, preview_import};
+use transfer::{
+    apply_import, apply_import_file, choose_import_file, export_aliases, export_library,
+    preview_import, preview_import_file,
+};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -75,6 +78,9 @@ pub fn run() {
             export_library,
             preview_import,
             apply_import,
+            choose_import_file,
+            preview_import_file,
+            apply_import_file,
             get_keybind_settings,
             set_show_focus_keybind,
             set_toggle_visibility_keybind,

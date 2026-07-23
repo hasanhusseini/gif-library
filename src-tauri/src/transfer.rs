@@ -5,17 +5,24 @@ use crate::{
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rusqlite::{params, OptionalExtension};
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
-    fs,
+    fs::{self, File},
+    io::{BufReader, Read},
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_dialog::{DialogExt, FilePath};
 
 const FORMAT_VERSION: u8 = 1;
 const MAX_IMPORT_BYTES: usize = 50 * 1024 * 1024;
+const MAX_TRANSFER_PAYLOAD_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -76,6 +83,14 @@ pub struct ImportResult {
     alias_matched_records: usize,
     aliases_added: usize,
     aliases_skipped: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportFileSelection {
+    path: String,
+    file_name: String,
+    size_bytes: u64,
 }
 
 #[tauri::command]
@@ -216,6 +231,93 @@ pub(crate) fn export_data(
     .map_err(|error| format!("failed to serialize export: {error}"))
 }
 
+#[tauri::command]
+pub fn choose_import_file(app: AppHandle) -> Result<Option<ImportFileSelection>, String> {
+    let Some(selected) = app
+        .dialog()
+        .file()
+        .add_filter("JSON", &["json"])
+        .blocking_pick_file()
+    else {
+        return Ok(None);
+    };
+    let path = match selected {
+        FilePath::Path(path) => path,
+        FilePath::Url(_) => return Err("The selected import file is not a local file.".into()),
+    };
+    import_file_selection(path).map(Some)
+}
+
+#[tauri::command]
+pub fn preview_import_file(
+    database: State<'_, Database>,
+    path: String,
+) -> Result<ImportPreview, String> {
+    let path = validate_import_file_path(&path)?;
+    let connection = database
+        .connection
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let mut conflicts = Vec::new();
+    let mut conflict_count = 0;
+    let mut item_count = 0;
+    let mut local = 0;
+    let mut remote = 0;
+    let mut alias_match_count = 0;
+    let mut alias_unmatched_count = 0;
+    let mut alias_unmatched = Vec::new();
+    let kind = stream_transfer_file(&path, |kind, item| {
+        item_count += 1;
+        if item.source_kind == "local_file" {
+            local += 1;
+        } else {
+            remote += 1;
+        }
+        let matched = find_conflict(&connection, &item)?.is_some();
+        if matched {
+            conflict_count += 1;
+            if conflicts.len() < 100 {
+                conflicts.push(item.title.clone());
+            }
+        }
+        if kind == "aliases" {
+            if matched {
+                alias_match_count += 1;
+            } else {
+                alias_unmatched_count += 1;
+                if alias_unmatched.len() < 100 {
+                    alias_unmatched.push(item.title);
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(ImportPreview {
+        kind,
+        item_count,
+        conflict_count,
+        local_file_count: local,
+        remote_url_count: remote,
+        conflicts,
+        alias_match_count,
+        alias_unmatched_count,
+        alias_unmatched,
+    })
+}
+
+#[tauri::command]
+pub fn apply_import_file(
+    database: State<'_, Database>,
+    path: String,
+    conflict_strategy: String,
+    destination_folder_id: Option<i64>,
+) -> Result<ImportResult, String> {
+    if !matches!(conflict_strategy.as_str(), "skip" | "import_anyway") {
+        return Err("invalid conflict strategy".into());
+    }
+    let path = validate_import_file_path(&path)?;
+    apply_transfer_file(&database, &path, &conflict_strategy, destination_folder_id)
+}
 #[tauri::command]
 pub fn preview_import(
     database: State<'_, Database>,
@@ -389,6 +491,133 @@ fn apply_transfer(
     })
 }
 
+fn apply_transfer_file(
+    database: &Database,
+    path: &Path,
+    conflict_strategy: &str,
+    destination_folder_id: Option<i64>,
+) -> Result<ImportResult, String> {
+    let mut connection = database
+        .connection
+        .lock()
+        .map_err(|_| "database lock poisoned")?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("failed to start import transaction: {error}"))?;
+    let mut imported = 0;
+    let mut skipped = 0;
+    let mut imported_files = 0;
+    let mut imported_links = 0;
+    let mut skipped_duplicates = 0;
+    let mut written_paths = Vec::new();
+    let mut unmatched_aliases = Vec::new();
+    let mut alias_matched_records = 0;
+    let mut aliases_added = 0;
+    let mut aliases_skipped = 0;
+    let mut destination_checked = false;
+    let result = stream_transfer_file(path, |kind, item| {
+        if !destination_checked {
+            validate_import_destination(&transaction, kind, destination_folder_id)?;
+            destination_checked = true;
+        }
+        let mut conflict_id = find_conflict(&transaction, &item)?;
+        if kind == "aliases" {
+            if let Some(media_id) = conflict_id {
+                if !media_is_in_scope(&transaction, media_id, destination_folder_id)? {
+                    conflict_id = None;
+                }
+            }
+            let Some(media_id) = conflict_id else {
+                skipped += 1;
+                aliases_skipped += normalize_names(item.alias_names).len();
+                unmatched_aliases.push(item.title);
+                return Ok(());
+            };
+            alias_matched_records += 1;
+            for alias in normalize_names(item.alias_names) {
+                let changed = transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO aliases (media_id, name) VALUES (?1, ?2)",
+                        params![media_id, alias],
+                    )
+                    .map_err(|error| format!("failed to import alias: {error}"))?;
+                if changed > 0 {
+                    aliases_added += 1;
+                } else {
+                    aliases_skipped += 1;
+                }
+            }
+            imported += 1;
+            return Ok(());
+        }
+        if conflict_id.is_some() && conflict_strategy == "skip" {
+            skipped += 1;
+            skipped_duplicates += 1;
+            return Ok(());
+        }
+        let is_file = item.source_kind == "local_file";
+        match import_library_item(database, &transaction, item, destination_folder_id) {
+            Ok(paths) => written_paths.extend(paths),
+            Err(error) => {
+                cleanup_files(&written_paths);
+                return Err(error);
+            }
+        }
+        imported += 1;
+        if is_file {
+            imported_files += 1;
+        } else {
+            imported_links += 1;
+        }
+        Ok(())
+    });
+    if let Err(error) = result {
+        cleanup_files(&written_paths);
+        return Err(error);
+    }
+    if !destination_checked {
+        validate_import_destination(&transaction, "library", destination_folder_id)?;
+    }
+    if let Err(error) = transaction.commit() {
+        cleanup_files(&written_paths);
+        return Err(format!("failed to commit import transaction: {error}"));
+    }
+    Ok(ImportResult {
+        imported,
+        skipped,
+        imported_files,
+        imported_links,
+        skipped_duplicates,
+        skipped_unsupported: 0,
+        unmatched_aliases,
+        alias_matched_records,
+        aliases_added,
+        aliases_skipped,
+    })
+}
+
+fn validate_import_destination(
+    connection: &rusqlite::Connection,
+    kind: &str,
+    folder_id: Option<i64>,
+) -> Result<(), String> {
+    if let Some(folder_id) = folder_id {
+        if kind == "aliases" && folder_id == -1 {
+            return Ok(());
+        }
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM folders WHERE id = ?1)",
+                [folder_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("failed to validate import destination: {error}"))?;
+        if !exists {
+            return Err("The selected import destination no longer exists.".into());
+        }
+    }
+    Ok(())
+}
 fn media_is_in_scope(
     connection: &rusqlite::Connection,
     media_id: i64,
@@ -414,8 +643,8 @@ fn media_is_in_scope(
 }
 
 fn parse_transfer(payload: &str) -> Result<TransferFile, String> {
-    if payload.len() > 400 * 1024 * 1024 {
-        return Err("import file is too large".into());
+    if payload.len() as u64 > MAX_TRANSFER_PAYLOAD_BYTES {
+        return Err("import file is too large; maximum import size is 10 GB".into());
     }
     let transfer: TransferFile =
         serde_json::from_str(payload).map_err(|error| format!("invalid import file: {error}"))?;
@@ -428,6 +657,194 @@ fn parse_transfer(payload: &str) -> Result<TransferFile, String> {
     Ok(transfer)
 }
 
+fn import_file_selection(path: PathBuf) -> Result<ImportFileSelection, String> {
+    let path = validate_import_file_path(path.to_string_lossy().as_ref())?;
+    let metadata = path
+        .metadata()
+        .map_err(|error| format!("failed to read import file metadata: {error}"))?;
+    Ok(ImportFileSelection {
+        file_name: path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("Import file")
+            .to_string(),
+        path: path.to_string_lossy().to_string(),
+        size_bytes: metadata.len(),
+    })
+}
+
+fn validate_import_file_path(path: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path);
+    let metadata = path
+        .metadata()
+        .map_err(|error| format!("failed to read import file: {error}"))?;
+    if !metadata.is_file() {
+        return Err("The selected import path is not a file.".into());
+    }
+    if metadata.len() > MAX_TRANSFER_PAYLOAD_BYTES {
+        return Err("import file is too large; maximum import size is 10 GB".into());
+    }
+    Ok(path)
+}
+
+fn stream_transfer_file<F>(path: &Path, mut on_item: F) -> Result<String, String>
+where
+    F: FnMut(&str, TransferItem) -> Result<(), String>,
+{
+    let file = File::open(path).map_err(|error| format!("failed to open import file: {error}"))?;
+    stream_transfer_reader(BufReader::new(file), &mut on_item)
+}
+
+fn stream_transfer_reader<R, F>(reader: R, on_item: &mut F) -> Result<String, String>
+where
+    R: Read,
+    F: FnMut(&str, TransferItem) -> Result<(), String>,
+{
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    TransferStreamSeed { on_item }
+        .deserialize(&mut deserializer)
+        .map_err(|error| format!("invalid import file: {error}"))
+}
+
+struct TransferStreamSeed<'a, F> {
+    on_item: &'a mut F,
+}
+
+impl<'de, 'a, F> DeserializeSeed<'de> for TransferStreamSeed<'a, F>
+where
+    F: FnMut(&str, TransferItem) -> Result<(), String>,
+{
+    type Value = String;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(TransferStreamVisitor {
+            on_item: self.on_item,
+        })
+    }
+}
+
+struct TransferStreamVisitor<'a, F> {
+    on_item: &'a mut F,
+}
+
+impl<'de, 'a, F> Visitor<'de> for TransferStreamVisitor<'a, F>
+where
+    F: FnMut(&str, TransferItem) -> Result<(), String>,
+{
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a GIF Library transfer object")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut version = None;
+        let mut kind: Option<String> = None;
+        let mut items_seen = false;
+        let on_item = self.on_item;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "version" => version = Some(map.next_value::<u8>()?),
+                "kind" => {
+                    let value = map.next_value::<String>()?;
+                    if !matches!(value.as_str(), "library" | "aliases") {
+                        return Err(de::Error::custom("unsupported import type"));
+                    }
+                    kind = Some(value);
+                }
+                "items" => {
+                    let Some(kind_value) = kind.as_deref() else {
+                        return Err(de::Error::custom(
+                            "import file must declare kind before items",
+                        ));
+                    };
+                    validate_transfer_header(version, kind_value).map_err(de::Error::custom)?;
+                    map.next_value_seed(TransferItemsSeed {
+                        kind: kind_value,
+                        on_item: &mut *on_item,
+                    })?;
+                    items_seen = true;
+                }
+                _ => {
+                    let _: IgnoredAny = map.next_value()?;
+                }
+            }
+        }
+        let kind = kind.ok_or_else(|| de::Error::custom("import file is missing kind"))?;
+        validate_transfer_header(version, &kind).map_err(de::Error::custom)?;
+        if !items_seen {
+            return Err(de::Error::custom("import file is missing items"));
+        }
+        Ok(kind)
+    }
+}
+
+struct TransferItemsSeed<'a, 'b, F> {
+    kind: &'a str,
+    on_item: &'b mut F,
+}
+
+impl<'de, 'a, 'b, F> DeserializeSeed<'de> for TransferItemsSeed<'a, 'b, F>
+where
+    F: FnMut(&str, TransferItem) -> Result<(), String>,
+{
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(TransferItemsVisitor {
+            kind: self.kind,
+            on_item: self.on_item,
+        })
+    }
+}
+
+struct TransferItemsVisitor<'a, 'b, F> {
+    kind: &'a str,
+    on_item: &'b mut F,
+}
+
+impl<'de, 'a, 'b, F> Visitor<'de> for TransferItemsVisitor<'a, 'b, F>
+where
+    F: FnMut(&str, TransferItem) -> Result<(), String>,
+{
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an array of transfer items")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while let Some(item) = sequence.next_element::<TransferItem>()? {
+            (self.on_item)(self.kind, item).map_err(de::Error::custom)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_transfer_header(version: Option<u8>, kind: &str) -> Result<(), String> {
+    let Some(version) = version else {
+        return Err("import file is missing version".into());
+    };
+    if version != FORMAT_VERSION {
+        return Err(format!("unsupported import version: {version}"));
+    }
+    if !matches!(kind, "library" | "aliases") {
+        return Err("unsupported import type".into());
+    }
+    Ok(())
+}
 fn find_conflict(
     connection: &rusqlite::Connection,
     item: &TransferItem,

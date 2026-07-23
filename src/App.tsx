@@ -12,6 +12,7 @@ type MediaRecord = {
 };
 type FolderRecord = { id: number; name: string; parentId: number | null; path: string; smart?: boolean };
 type ImportPreview = { kind: string; itemCount: number; conflictCount: number; localFileCount: number; remoteUrlCount: number; conflicts: string[]; aliasMatchCount: number; aliasUnmatchedCount: number; aliasUnmatched: string[] };
+type ImportFileSelection = { path: string; fileName: string; sizeBytes: number };
 type PreviewData = { bytes: number[]; mimeType: string };
 type EditState = { item: MediaRecord; title: string; notes: string; externalUrl: string; tags: string; aliases: string; folderIds: number[] };
 type FolderDeleteState = { folder: FolderRecord; childFolderCount: number; mediaCount: number };
@@ -41,7 +42,7 @@ export function App() {
   const [folders, setFolders] = useState<FolderRecord[]>([]);
   const [newFolder, setNewFolder] = useState("");
   const [parentFolder, setParentFolder] = useState("");
-  const [importPayload, setImportPayload] = useState("");
+  const [importFile, setImportFile] = useState<ImportFileSelection | null>(null);
   const [importPreview, setImportPreview] = useState<ImportPreview | null>(null);
   const [conflictStrategy, setConflictStrategy] = useState("skip");
   const [globalQuery, setGlobalQuery] = useState("");
@@ -295,25 +296,27 @@ export function App() {
     catch (reason) { setError(`Could not clear export location: ${String(reason)}`); }
   }
 
-  async function selectImport(file: File | null) {
-    setImportPreview(null); setImportPayload(""); setError("");
-    if (!file) return;
+  async function selectImport() {
+    setImportPreview(null); setImportFile(null); setError(""); setNotice("");
     setImportDestination("current"); setImportFolderId(""); setImportNewFolder("");
+    setBusy(true);
     try {
-      const payload = await file.text();
-      const preview = await invoke<ImportPreview>("preview_import", { payload });
-      setImportPayload(payload); setImportPreview(preview);
+      const selected = await invoke<ImportFileSelection | null>("choose_import_file");
+      if (!selected) return;
+      const preview = await invoke<ImportPreview>("preview_import_file", { path: selected.path });
+      setImportFile(selected); setImportPreview(preview);
     } catch (reason) { setError(String(reason)); }
+    finally { setBusy(false); }
   }
 
   function closeImport() {
     if (busy) return;
-    setImportPayload("");
+    setImportFile(null);
     setImportPreview(null);
   }
 
   async function applyTransfer() {
-    if (!importPreview) return;
+    if (!importPreview || !importFile) return;
     setBusy(true); setError("");
     try {
       let destinationFolderId: number | null = null;
@@ -331,14 +334,14 @@ export function App() {
         const folder = await invoke<FolderRecord>("create_folder", { name: importNewFolder, parentId: currentFolder?.smart ? null : currentFolderId });
         destinationFolderId = folder.id; destinationLabel = `'${folder.name}'`;
       }
-      const result = await invoke<{ imported: number; skipped: number; importedFiles: number; importedLinks: number; skippedDuplicates: number; skippedUnsupported: number; unmatchedAliases: string[]; aliasMatchedRecords: number; aliasesAdded: number; aliasesSkipped: number }>("apply_import", { payload: importPayload, conflictStrategy, destinationFolderId });
+      const result = await invoke<{ imported: number; skipped: number; importedFiles: number; importedLinks: number; skippedDuplicates: number; skippedUnsupported: number; unmatchedAliases: string[]; aliasMatchedRecords: number; aliasesAdded: number; aliasesSkipped: number }>("apply_import_file", { path: importFile.path, conflictStrategy, destinationFolderId });
       if (importPreview.kind === "aliases") {
         const scope = destinationFolderId === null ? "the full library" : destinationLabel;
         const unmatched = result.unmatchedAliases.length;
         const message = result.aliasesAdded === 0
           ? `No matching media with new aliases found in ${scope}. No aliases were imported. ${result.aliasMatchedRecords} matched record${result.aliasMatchedRecords === 1 ? "" : "s"}; ${result.aliasesSkipped} aliases skipped; ${unmatched} unmatched item${unmatched === 1 ? "" : "s"}.`
           : `Imported ${result.aliasesAdded} alias${result.aliasesAdded === 1 ? "" : "es"} into ${scope}. ${result.aliasMatchedRecords} matched record${result.aliasMatchedRecords === 1 ? "" : "s"}; ${result.aliasesSkipped} aliases skipped; ${unmatched} unmatched item${unmatched === 1 ? "" : "s"}.`;
-        setNotice(message); setImportPayload(""); setImportPreview(null); await refresh();
+        setNotice(message); setImportFile(null); setImportPreview(null); await refresh();
         return;
       }
       const parts = [];
@@ -351,7 +354,7 @@ export function App() {
       if (result.skippedUnsupported) skippedParts.push(`${result.skippedUnsupported} unsupported item${result.skippedUnsupported === 1 ? "" : "s"}`);
       if (result.unmatchedAliases.length) skippedParts.push(`${result.unmatchedAliases.length} unmatched alias record${result.unmatchedAliases.length === 1 ? "" : "s"}`);
       if (skippedParts.length) message += ` Skipped ${skippedParts.join(" and ")}.`;
-      setNotice(message); setImportPayload(""); setImportPreview(null); await refresh();
+      setNotice(message); setImportFile(null); setImportPreview(null); await refresh();
     } catch (reason) { setError(`Import failed: ${reason instanceof Error ? reason.message : String(reason)}`); } finally { setBusy(false); }
   }
 
@@ -582,7 +585,7 @@ export function App() {
     try {
       const result = await invoke<{ cleanupFailures: string[] }>("wipe_library", { confirmation: wipeConfirmation });
       setWipeOpen(false); setSettingsOpen(false); setWipeConfirmation(""); setUndoStack([]);
-      setImportPayload(""); setImportPreview(null); setCurrentFolderId(null);
+      setImportFile(null); setImportPreview(null); setCurrentFolderId(null);
       await Promise.all([refresh(), loadKeybinds(), loadExportSettings()]);
       if (result.cleanupFailures.length) setError(`Library records were wiped, but cleanup was incomplete: ${result.cleanupFailures.join("; ")}.`);
       else setNotice("Library wiped");
@@ -722,7 +725,7 @@ export function App() {
         </details>
         </section>
         <section className="folder-builder"><h2>Folders</h2><div className="folder-list">{folders.map((folder) => <div key={folder.id}><span>{folder.path}</span><button onClick={() => renameExistingFolder(folder)}>Rename</button><button onClick={() => inspectFolderDelete(folder)}>Delete</button></div>)}</div><label>New folder name<input value={newFolder} onChange={(e) => setNewFolder(e.target.value)} placeholder="Reactions" /></label><label>Inside<select value={parentFolder} onChange={(e) => setParentFolder(e.target.value)}><option value="">Top level</option>{folders.map((folder) => <option key={folder.id} value={folder.id}>{folder.path}</option>)}</select></label><button className="secondary" type="button" disabled={!newFolder.trim()} onClick={addFolder}>Create folder</button></section>
-        <section className="transfer-panel"><h2>Backup &amp; share</h2><button className="secondary" onClick={() => setExportOpen(true)}>Export</button><label className="file-picker">Import JSON<input type="file" accept=".json,application/json" onChange={(event) => selectImport(event.target.files?.[0] ?? null)} /><span>Choose export file</span></label></section>
+        <section className="transfer-panel"><h2>Backup &amp; share</h2><button className="secondary" onClick={() => setExportOpen(true)}>Export</button><button className="secondary" disabled={busy} onClick={selectImport}>Import JSON</button></section>
       </aside>
 
       <section className="library" aria-live="polite">
